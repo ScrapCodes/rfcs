@@ -77,12 +77,6 @@ DuckDb also allows the user to specify a similar helper function to transform so
 see [duckdb#113](https://github.com/duckdb/duckdb/pull/1133/files#diff-0833c08516123b2a2b239dd25daabdf5a3b0da8c51e00fddbcfd7965c47bc4b6)
 
 
-#### Apache spark:
-
-Acc. https://jaceklaskowski.gitbooks.io/mastering-spark-sql/content/spark-sql-udfs-blackbox.html , spark treats UDFs as black box. 
-Code citation: [Spark does not have stats for functions](https://github.com/apache/spark/blob/v4.0.0-preview1/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/plans/logical/statsEstimation/FilterEstimation.scala#L206)
-It has special casing for common operators: [code ref](https://github.com/apache/spark/blob/v4.0.0-preview1/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/plans/logical/statsEstimation/FilterEstimation.scala#L142)
-
 ### Goals
 
 1. Provide a mechanism for transforming source statistics for scalar functions
@@ -97,7 +91,7 @@ It has special casing for common operators: [code ref](https://github.com/apache
 
 We propose a phase wise implementation plan -
 
-* __Phase 1__.
+### Phase 1 - JAVA Function annotations
 
  * Support builtin scalar functions stats propagation implementation for JAVA.
 
@@ -105,20 +99,6 @@ We propose a phase wise implementation plan -
 in java with fields as follows:
 
 ```java
-/**
- * By default, a function is just a “black box” that the database system knows very little about the behavior of.
- * However, that means that queries using the function may be executed much less efficiently than they could be.
- * It is possible to supply additional knowledge that helps the planner optimize function calls.
- * Scalar functions are straight forward to optimize and can have impact on the overall query performance.
- * Use this annotation to provide information regarding how this function impacts following query statistics.
- * <p>
- * A function may take one or more input column or a constant as parameters. Precise stats may depend on the input
- * parameters. This annotation does not cover all the possible cases and allows constant values for the following fields.
- * Value Double.NaN implies unknown.
- * </p>
- * 
- * Note: Constant stats takes precedence over all.
- */
 @Retention(RUNTIME)
 @Target(METHOD)
 public @interface ScalarFunctionConstantStats
@@ -126,9 +106,6 @@ public @interface ScalarFunctionConstantStats
   // Min max value is NaN if unknown.
   double minValue() default Double.NaN;
   double maxValue() default Double.NaN;
-
-  // Histogram
-  HistogramTypes histogram() default HistogramTypes.UNKNOWN;
 
   /**
    * The constant distinct values count to be applied.
@@ -246,7 +223,7 @@ Examples of using above annotations for various function in `StringFunctions.jav
 }
 ```
 
- __Propagate all stats but, for nullFraction, avgRowSize and distinctValuesCount follow as specified.__
+ __Propagate all stats but, for nullFraction, avgRowSize and distinctValuesCount use the specified values.__
 
 4. An example of using both `ScalarFunctionConstantStats` and `ScalarPropagateSourceStats`.
 ```java
@@ -260,35 +237,14 @@ Examples of using above annotations for various function in `StringFunctions.jav
   }
 ```
 
+### Phase 2 - Native function annotation
+
 For C++ functions, `VectorFunctionMetadata` is expanded to include `constantStats` and
 `transformSourceStats` as follows.
 
 ```c++
 
 struct VectorFunctionMetadata {
-  /// Boolean indicating whether this function supports flattening, i.e.
-  /// converting a set of nested calls into a single call.
-  ///
-  ///     f(a, f(b, f(c, d))) => f(a, b, c, d).
-  ///
-  /// For example, concat(string,...), concat(array,...), map_concat(map,...)
-  /// Presto functions support flattening. Similarly, built-in special format
-  /// AND and OR also support flattening.
-  ///
-  /// A function that supports flattening must have a signature with variadic
-  /// arguments of the same type. The result type must be the same as input
-  /// type.
-  bool supportsFlattening{false};
-
-  /// True if the function is deterministic, e.g given same inputs always
-  /// returns same result.
-  bool deterministic{true};
-
-  /// True if null in any argument always produces null result.
-  /// In this case, 'rows' in VectorFunction::apply will point only to positions
-  /// for which all arguments are not null.
-  bool defaultNullBehavior{true};
-
   /// Constant stats produced by the function, NAN represent unknown values.
   /// If constant stats are provided they take precedence over the results of
   /// transformSourceStats
@@ -296,6 +252,9 @@ struct VectorFunctionMetadata {
 
   /// map of function position argument to source statistics transformation.
   std::map<int, VectorFunctionPropagateSourceStats> transformSourceStats;
+
+    ...
+
 };
 ```
 
@@ -369,17 +328,16 @@ return {
 }
 ```
 
-#### How does a C++ worker communicates functions stats behaviour and constant stats to the coordinator.
+#### How does a C++ worker communicate functions stats behavior and constant stats to the coordinator.
 
 We will extend the ongoing work described in [RFC-0003](RFC-0003-native-spi.md), with function registries to include function metadata.
-In both Java and C++, builtin functions have extra metadata () defined in FunctionMetadata class, which is used while computing estimated stats
-for optimizer.
+In both Java and C++, builtin functions have extra metadata () defined in FunctionMetadata class, which is used while computing stats
 
 * __Phase 2__. Annotate some of the builtin scalar functions with appropriate annotations.
 
 Note: At this stage an exhaustive list is not ready.
 
-List of functions:
+### List of functions:
 1. All functions in presto-main/src/main/java/com/facebook/presto/operator/scalar/MathFunctions.java
 2. All functions in presto-main/src/main/java/com/facebook/presto/operator/scalar/StringFunctions.java
 3. `getHash` in presto-main/src/main/java/com/facebook/presto/operator/scalar/CombineHashFunction.java 
@@ -388,10 +346,12 @@ List of functions:
 
 A slice can represent a column or a constant string. In case of 
 
-* __Phase 3__. Extend the support to non-built-in UDFs. Add documentations and blogs with usage examples.
+* __Phase 3__. Extend the support to non-built-in UDFs. Add documentation and blogs with usage examples.
 
 * __Future work__.
 
+
+### Define an expression language
 The following example is a more powerful form of expressing how to estimate stats for functions based on their characteristics. Here,
 we propose the use of expressions ( i.e an expression language with a fixed grammar ) In the following example of `substr` :
 For average row size we have used the value of length argument. For distinct values count it is more complex, e.g. if length is same as
@@ -413,6 +373,8 @@ the upper bound for `varchar(x)` i.e. `x` , then use source stat `distinct value
 ```
 
 `substr` is at the heart of all `LIKE %X` statements, which is widely used. Without a more powerful framework support it is difficult to support a stats estimation. 
+
+### Free form virtual functions
 
 ## Metrics
 
